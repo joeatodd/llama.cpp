@@ -3140,7 +3140,7 @@ typedef float (*vec_dot_q_mul_mat_sycl_t)(
     const int *__restrict__ y_qs, const sycl::half2 *__restrict__ y_ms,
     const int &i, const int &j, const int &k);
 
-#define WARP_SIZE 32
+#define WARP_SIZE 32  // warp size here
 #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
 
 #define SYCL_GELU_BLOCK_SIZE 256
@@ -3274,8 +3274,8 @@ class sycl_gpu_mgr {
                     continue;
                 dpct::device_info prop;
                 dpct::get_device_info(prop, device);
-                if (max_compute_units == prop.get_max_compute_units() &&
-                    is_ext_oneapi_device(device)) {
+                if (max_compute_units == prop.get_max_compute_units() /* &&
+                    is_ext_oneapi_device(device) */) {
                     gpus.push_back(id);
                     devices.push_back(device);
                     work_group_size = prop.get_max_work_group_size();
@@ -4291,29 +4291,49 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
                                   const sycl::nd_item<3> &item_ct1) {
     const block_q4_K * x = (const block_q4_K *) vx;
 
-    const int i = item_ct1.get_group(2);
+    const int tidx = item_ct1.get_global_linear_id();
+    const int i =  tidx / 32; //pseudo work-group (threads independent anyway)
 
 #if QK_K == 256
     // assume 32 threads
-    const int tid = item_ct1.get_local_id(2);
-    const int il  = tid/8;
-    const int ir  = tid%8;
-    const int is  = 2*il;
-    const int n   = 4;
+    const int tid = tidx % 32; // Thread ID
+    const int il  = tid/8; // Into local groups of 8 threads  (0 - 3)
+    const int ir  = tid%8; // ID within that local group
+    const int is  = 2*il; // Stretched group (super group?)   (0, 2, 4, 6)
+    const int n   = 4;    // That's the number 4, yo
 
-    dst_t * y = yy + i*QK_K + 64*il + n*ir;
+    dst_t * y = yy + i*QK_K + 64*il;// + n*ir;
+
+    // How does `y` look for adjacent threads?
+    // Suppose :
+    // we have thread = 1 or 32 or 33 or 61
+    // We have i      = 0 or 1 or 1 or 1
+    // We have tid    = 1 or 0 or 1 or 29
+    // We have il     = 0 or 0 or 0 or 3
+    // We have ir     = 1 or 0 or 1 or 4
+    // We have is     =
+
+    // We have i*QK_K = 0 or 256 or 256 or 256
+    // We have 64*il  = 0 or 0 or 0 or 192
+    // We have n*ir   = 4 or 0 or 4 or 16
+
+    // We have yoffset= 4 or 256 or 260 or 464
 
     const float dall = x[i].dm[0];
     const float dmin = x[i].dm[1];
 
-    const uint8_t * q = x[i].qs + 32*il + n*ir;
+    const uint8_t * q = x[i].qs + 32*il; // + n*ir;
 
     uint8_t sc, m;
     get_scale_min_k4(is + 0, x[i].scales, sc, m);
-    const float d1 = dall * sc; const float m1 = dmin * m;
+    const float d1 = dall * sc;
+    const float m1 = dmin * m;
     get_scale_min_k4(is + 1, x[i].scales, sc, m);
-    const float d2 = dall * sc; const float m2 = dmin * m;
-    for (int l = 0; l < n; ++l) {
+    const float d2 = dall * sc;
+    const float m2 = dmin * m;
+
+    // for (int l = 0; l < n; ++l) {
+    for (int l = ir; l < n*8; l+=8) {
         y[l + 0] = d1 * (q[l] & 0xF) - m1;
         y[l +32] = d2 * (q[l] >>  4) - m2;
     }
@@ -7738,6 +7758,8 @@ vec_dot_iq4_xs_q8_1(const void *__restrict__ vbq,
 #endif
 }
 
+// The actual kernel
+// Likely to be coupling between qk/qr/qi and the work-group size.
 template <int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x,
           int mmq_y, int nwarps, load_tiles_sycl_t load_tiles, int vdr,
           vec_dot_q_mul_mat_sycl_t vec_dot>
@@ -10322,14 +10344,14 @@ static void dequantize_row_q4_1_sycl(const void *vx, dst_t *y, const int k,
 template <typename dst_t>
 static void dequantize_row_q4_K_sycl(const void *vx, dst_t *y, const int k,
                                      dpct::queue_ptr stream) {
-    const int nb = k / QK_K;
+    const int nb = k / (QK_K * 4);
     {
         dpct::has_capability_or_fail(stream->get_device(),
                                      {sycl::aspect::fp16});
 
         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
-                                                   sycl::range<3>(1, 1, 32),
-                                               sycl::range<3>(1, 1, 32)),
+                                                   sycl::range<3>(1, 1, 128),
+                                               sycl::range<3>(1, 1, 128)),
                              [=](sycl::nd_item<3> item_ct1) {
                                  dequantize_block_q4_K(vx, y, item_ct1);
                              });
@@ -15732,7 +15754,7 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-
+// entry point for GEMM
 static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool all_on_device =
         (src0->backend == GGML_BACKEND_TYPE_GPU || src0->backend == GGML_BACKEND_TYPE_GPU_SPLIT) &&
@@ -15773,7 +15795,7 @@ static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
     } else if (!split && all_on_device && use_xmx && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1)) {
         // KQ + KQV multi-batch
         // GGML_SYCL_DEBUG("ggml_sycl_mul_mat_batched_sycl\n");
-        ggml_sycl_mul_mat_batched_sycl(src0, src1, dst);
+        ggml_sycl_mul_mat_batched_sycl(src0, src1, dst); // this goes to oneMKL GEMM (src0 = f16)
     } else if (src0->type == GGML_TYPE_F32) {
         // GGML_SYCL_DEBUG("ggml_sycl_op_mul_mat\n");
         ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_mul_mat_sycl, false);
@@ -15795,7 +15817,7 @@ static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
 
             if (use_mul_mat_vec_q) {
                 // GGML_SYCL_DEBUG("ggml_sycl_mul_mat ggml_sycl_op_mul_mat_vec_q path\n");
-                ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_mul_mat_vec_q, true);
+                ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_mul_mat_vec_q, true); // src0 is q4 instead of f16
             } else {
                 // GGML_SYCL_DEBUG("ggml_sycl_mul_mat ggml_sycl_op_dequantize_mul_mat_vec path\n");
                 ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec, false);
